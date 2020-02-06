@@ -32,11 +32,7 @@ from PyQt5.QtWidgets import QListView, QMenu
 from classes.app import get_app
 from windows.models.titles_model import TitlesModel
 
-try:
-    import json
-except ImportError:
-    import simplejson as json
-
+import json
 
 class TitlesListView(QListView):
     """ A QListView QWidget used on the title editor window """
@@ -89,7 +85,6 @@ class TitlesListView(QListView):
         self.setUniformItemSizes(True)
         self.setWordWrap(True)
         self.setTextElideMode(Qt.ElideRight)
-        self.setStyleSheet('QListView::item { padding-top: 2px; }')
 
         # Refresh view
         self.refresh_view()

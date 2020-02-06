@@ -29,10 +29,12 @@
 
 import os
 import sys
+import time
 from copy import deepcopy
 from functools import partial
 from random import uniform
 from urllib.parse import urlparse
+from operator import itemgetter
 
 import openshot  # Python module for libopenshot (required video editing module installed separately)
 from PyQt5.QtCore import QFileInfo, pyqtSlot, QUrl, Qt, QCoreApplication, QTimer
@@ -46,13 +48,9 @@ from classes.app import get_app
 from classes.logger import log
 from classes.query import File, Clip, Transition, Track
 from classes.waveform import get_audio_data
-from classes.thumbnail import GenerateThumbnail
 from classes.conversion import zoomToSeconds, secondsToZoom
 
-try:
-    import json
-except ImportError:
-    import simplejson as json
+import json
 
 # Constants used by this file
 JS_SCOPE_SELECTOR = "$('body').scope()"
@@ -165,12 +163,25 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         """Document.Ready event has fired, and is initialized"""
         self.document_is_ready = True
 
-    def eval_js(self, code):
+    @pyqtSlot(result=str)
+    def get_thumb_address(self):
+        """Return the thumbnail HTTP server address"""
+        thumb_server_details = get_app().window.http_server_thread.server_address
+        while not thumb_server_details:
+            log.info('No HTTP thumbnail server found yet... keep waiting...')
+            time.sleep(0.25)
+            thumb_server_details = get_app().window.http_server_thread.server_address
+
+        thumb_address = "http://%s:%s/thumbnails/" % (thumb_server_details[0], thumb_server_details[1])
+        return thumb_address
+
+    def eval_js(self, code, retries=0):
         # Check if document.Ready has fired in JS
         if not self.document_is_ready:
             # Not ready, try again in a few milliseconds
-            log.error("TimelineWebView::eval_js() called before document ready event. Script queued: %s" % code)
-            QTimer.singleShot(50, partial(self.eval_js, code))
+            if retries > 1:
+                log.warning("TimelineWebView::eval_js() called before document ready event. Script queued: %s" % code)
+            QTimer.singleShot(100, partial(self.eval_js, code, retries+1))
             return None
         else:
             # Execute JS code
@@ -178,6 +189,10 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
 
     # This method is invoked by the UpdateManager each time a change happens (i.e UpdateInterface)
     def changed(self, action):
+        # Remove unused action attribute (old_values)
+        action = deepcopy(action)
+        action.old_values = {}
+
         # Send a JSON version of the UpdateAction to the timeline webview method: ApplyJsonDiff()
         if action.type == "load":
             # Initialize translated track name
@@ -194,12 +209,17 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         # Reset the scale when loading new JSON
         if action.type == "load":
             # Set the scale again (to project setting)
-            initial_scale = get_app().project.get(["scale"]) or 15
+            initial_scale = get_app().project.get("scale") or 15
             get_app().window.sliderZoom.setValue(secondsToZoom(initial_scale))
 
+            # The setValue() above doesn't trigger update_zoom when a project file is
+            # loaded on the command line (too early?), so also call the JS directly
+            cmd = JS_SCOPE_SELECTOR + ".setScale(" + str(initial_scale) + ", 0);"
+            self.eval_js(cmd)
+
     # Javascript callable function to update the project data when a clip changes
-    @pyqtSlot(str)
-    def update_clip_data(self, clip_json, only_basic_props=True, ignore_reader=False):
+    @pyqtSlot(str, bool, bool, bool)
+    def update_clip_data(self, clip_json, only_basic_props=True, ignore_reader=False, ignore_refresh=False):
         """ Create an updateAction and send it to the update manager """
 
         # read clip json
@@ -218,12 +238,6 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
             # Create a new clip (if not exists)
             existing_clip = Clip()
 
-        # Determine if "start" changed
-        start_changed = False
-        if existing_clip.data and existing_clip.data["start"] != clip_data["start"] and clip_data["reader"]["has_video"] and not clip_data["reader"]["has_single_image"]:
-            # Update thumbnail
-            self.UpdateClipThumbnail(clip_data)
-
         # Update clip data
         existing_clip.data = clip_data
 
@@ -233,7 +247,6 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
             existing_clip.data["id"] = clip_data["id"]
             existing_clip.data["layer"] = clip_data["layer"]
             existing_clip.data["position"] = clip_data["position"]
-            existing_clip.data["image"] = clip_data["image"]
             existing_clip.data["start"] = clip_data["start"]
             existing_clip.data["end"] = clip_data["end"]
 
@@ -244,48 +257,10 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         # Save clip
         existing_clip.save()
 
-        # Update the preview and reselct current frame in properties
-        get_app().window.refreshFrameSignal.emit()
-        get_app().window.propertyTableView.select_frame(self.window.preview_thread.player.Position())
-
-    # Update Thumbnails for modified clips
-    def UpdateClipThumbnail(self, clip_data):
-        """Update the thumbnail image for clips"""
-
-        # Get project's frames per second
-        fps = clip_data["reader"]["fps"]
-        fps_float = float(fps["num"]) / float(fps["den"])
-
-        # Get starting time of clip
-        start_frame = round(float(clip_data["start"]) * fps_float) + 1
-
-        # Determine thumb path
-        thumb_path = os.path.join(info.THUMBNAIL_PATH, "{}-{}.png".format(clip_data["id"], start_frame))
-        log.info('Updating thumbnail image: %s' % thumb_path)
-
-        # Check if thumb exists
-        if not os.path.exists(thumb_path):
-
-            # Get file object
-            file = File.get(id=clip_data["file_id"])
-
-            if not file:
-                # File not found, do nothing
-                return
-
-            # Convert path to the correct relative path (based on this folder)
-            file_path = file.absolute_path()
-
-            # Determine if video overlay should be applied to thumbnail
-            overlay_path = ""
-            if file.data["media_type"] == "video":
-                overlay_path = os.path.join(info.IMAGES_PATH, "overlay.png")
-
-            # Create thumbnail image
-            GenerateThumbnail(file_path, thumb_path, start_frame, 98, 64, os.path.join(info.IMAGES_PATH, "mask.png"), overlay_path)
-
-            # Update clip_data to point to new thumbnail image
-            clip_data["image"] = thumb_path
+        # Update the preview and reselect current frame in properties
+        if not ignore_refresh:
+            get_app().window.refreshFrameSignal.emit()
+            get_app().window.propertyTableView.select_frame(self.window.preview_thread.player.Position())
 
     # Add missing transition
     @pyqtSlot(str)
@@ -294,7 +269,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         transition_details = json.loads(transition_json)
 
         # Get FPS from project
-        fps = get_app().project.get(["fps"])
+        fps = get_app().project.get("fps")
         fps_float = float(fps["num"]) / float(fps["den"])
 
         # Open up QtImageReader for transition Image
@@ -329,8 +304,8 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         self.update_transition_data(transitions_data, only_basic_props=False)
 
     # Javascript callable function to update the project data when a transition changes
-    @pyqtSlot(str)
-    def update_transition_data(self, transition_json, only_basic_props=True):
+    @pyqtSlot(str, bool, bool)
+    def update_transition_data(self, transition_json, only_basic_props=True, ignore_refresh=False):
         """ Create an updateAction and send it to the update manager """
 
         # read clip json
@@ -349,7 +324,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         existing_item.data = transition_data
 
         # Get FPS from project
-        fps = get_app().project.get(["fps"])
+        fps = get_app().project.get("fps")
         fps_float = float(fps["num"]) / float(fps["den"])
         duration = existing_item.data["end"] - existing_item.data["start"]
 
@@ -397,8 +372,9 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         existing_item.save()
 
         # Update the preview and reselct current frame in properties
-        get_app().window.refreshFrameSignal.emit()
-        get_app().window.propertyTableView.select_frame(self.window.preview_thread.player.Position())
+        if not ignore_refresh:
+            get_app().window.refreshFrameSignal.emit()
+            get_app().window.propertyTableView.select_frame(self.window.preview_thread.player.Position())
 
     # Prevent default context menu, and ignore, so that javascript can intercept
     def contextMenuEvent(self, event):
@@ -495,7 +471,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         tran_ids = self.window.selected_transitions
 
         # Get framerate
-        fps = get_app().project.get(["fps"])
+        fps = get_app().project.get("fps")
         fps_float = float(fps["num"]) / float(fps["den"])
 
         # Get playhead position
@@ -712,7 +688,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         Time_None = Time_Menu.addAction(_("Reset Time"))
         Time_None.triggered.connect(partial(self.Time_Triggered, MENU_TIME_NONE, clip_ids, '1X'))
         Time_Menu.addSeparator()
-        for speed, speed_values in [("Normal", ['1X']), ("Fast", ['2X', '4X', '8X', '16X', '32X']), ("Slow", ['1/2X', '1/4X', '1/8X', '1/16X', '1/32X'])]:
+        for speed, speed_values in [("Normal", ['1X']), ("Fast", ['2X', '4X', '8X', '16X']), ("Slow", ['1/2X', '1/4X', '1/8X', '1/16X'])]:
             Speed_Menu = QMenu(_(speed), self)
 
             for direction, direction_value in [("Forward", MENU_TIME_FORWARD), ("Backward", MENU_TIME_BACKWARD)]:
@@ -915,6 +891,9 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         # Convert waveform data to JSON
         serialized_audio_data = json.dumps(audio_data)
 
+        # Set waveform cache (with clip_id as key)
+        self.waveform_cache[clip_id] = serialized_audio_data
+
         # Pass to javascript timeline (and render)
         cmd = JS_SCOPE_SELECTOR + ".setAudioData('" + clip_id + "', " + serialized_audio_data + ");"
         self.page().mainFrame().evaluateJavaScript(cmd)
@@ -924,6 +903,12 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
 
         # Start timer to redraw audio
         self.redraw_audio_timer.start()
+
+    def Thumbnail_Updated(self, clip_id):
+        """Callback when thumbnail needs to be updated"""
+        # Pass to javascript timeline (and render)
+        cmd = JS_SCOPE_SELECTOR + ".updateThumbnail('" + clip_id + "');"
+        self.page().mainFrame().evaluateJavaScript(cmd)
 
     def Split_Audio_Triggered(self, action, clip_ids):
         """Callback for split audio context menus"""
@@ -941,13 +926,8 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
                 # Invalid clip, skip to next item
                 continue
 
-            # Filter out audio on the original clip
-            #p = openshot.Point(1, 0.0, openshot.CONSTANT) # Override has_audio keyframe to False
-            #p_object = json.loads(p.Json())
-            #clip.data["has_audio"] = { "Points" : [p_object]}
-
-            # Save filter on original clip
-            #clip.save()
+            # Get # of tracks
+            all_tracks = get_app().project.get("layers")
 
             # Clear audio override
             p = openshot.Point(1, -1.0, openshot.CONSTANT) # Override has_audio keyframe to False
@@ -970,18 +950,36 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
                 clip.data["channel_filter"] = { "Points" : [p_object]}
 
                 # Filter out video on the new clip
-                p = openshot.Point(1, 0.0, openshot.CONSTANT) # Override has_audio keyframe to False
+                p = openshot.Point(1, 0.0, openshot.CONSTANT) # Override has_video keyframe to False
                 p_object = json.loads(p.Json())
                 clip.data["has_video"] = { "Points" : [p_object]}
+                # Also set scale to None
+                # Workaround for https://github.com/OpenShot/openshot-qt/issues/2882
+                clip.data["scale"] = openshot.SCALE_NONE
+
+                # Get track below selected track (if any)
+                next_track_number = clip.data['layer']
+                found_track = False
+                for track in reversed(sorted(all_tracks, key=itemgetter('number'))):
+                    if found_track:
+                        next_track_number = track.get("number")
+                        break
+                    if track.get("number") == clip.data['layer']:
+                        found_track = True
+                        continue
 
                 # Adjust the layer, so this new audio clip doesn't overlap the parent
-                clip.data['layer'] = clip.data['layer'] - 1 # Add to layer below clip
+                clip.data['layer'] = next_track_number # Add to layer below clip
 
                 # Adjust the clip title
                 channel_label = _("(all channels)")
                 clip.data["title"] = clip_title + " " + channel_label
                 # Save changes
                 clip.save()
+
+                # Generate waveform for new clip
+                log.info("Generate waveform for split audio track clip id: %s" % clip.id)
+                self.Show_Waveform_Triggered([clip.id])
 
             if action == MENU_SPLIT_AUDIO_MULTIPLE:
                 # Get # of channels on clip
@@ -997,12 +995,26 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
                     clip.data["channel_filter"] = { "Points" : [p_object]}
 
                     # Filter out video on the new clip
-                    p = openshot.Point(1, 0.0, openshot.CONSTANT) # Override has_audio keyframe to False
+                    p = openshot.Point(1, 0.0, openshot.CONSTANT) # Override has_video keyframe to False
                     p_object = json.loads(p.Json())
                     clip.data["has_video"] = { "Points" : [p_object]}
+                    # Also set scale to None
+                    # Workaround for https://github.com/OpenShot/openshot-qt/issues/2882
+                    clip.data["scale"] = openshot.SCALE_NONE
+
+                    # Get track below selected track (if any)
+                    next_track_number = clip.data['layer']
+                    found_track = False
+                    for track in reversed(sorted(all_tracks, key=itemgetter('number'))):
+                        if found_track:
+                            next_track_number = track.get("number")
+                            break
+                        if track.get("number") == clip.data['layer']:
+                            found_track = True
+                            continue
 
                     # Adjust the layer, so this new audio clip doesn't overlap the parent
-                    clip.data['layer'] = max(clip.data['layer'] - 1, 0) # Add to layer below clip
+                    clip.data['layer'] = max(next_track_number, 0) # Add to layer below clip
 
                     # Adjust the clip title
                     channel_label = _("(channel %s)") % (channel + 1)
@@ -1010,6 +1022,10 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
 
                     # Save changes
                     clip.save()
+
+                    # Generate waveform for new clip
+                    log.info("Generate waveform for split audio track clip id: %s" % clip.id)
+                    self.Show_Waveform_Triggered([clip.id])
 
                     # Remove the ID property from the clip (so next time, it will create a new clip)
                     clip.id = None
@@ -1030,7 +1046,6 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
             clip.data["has_audio"] = { "Points" : [p_object]}
 
             # Save filter on original clip
-            #clip.save()
             self.update_clip_data(clip.data, only_basic_props=False, ignore_reader=True)
             clip.save()
 
@@ -1124,7 +1139,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
                 continue
 
             # Get framerate
-            fps = get_app().project.get(["fps"])
+            fps = get_app().project.get("fps")
             fps_float = float(fps["num"]) / float(fps["den"])
 
             # Get existing clip object
@@ -1471,7 +1486,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         right_edge = -1.0
 
         # Determine how far we're going to nudge (1/2 frame or 0.01s, whichever is larger)
-        fps = get_app().project.get(["fps"])
+        fps = get_app().project.get("fps")
         fps_float = float(fps["num"]) / float(fps["den"])
         nudgeDistance = float(action) / float(fps_float)
         nudgeDistance /= 2.0	# 1/2 frame
@@ -1642,7 +1657,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         prop_name = "alpha"
 
         # Get FPS from project
-        fps = get_app().project.get(["fps"])
+        fps = get_app().project.get("fps")
         fps_float = float(fps["num"]) / float(fps["den"])
 
         # Loop through each selected clip
@@ -1734,7 +1749,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
     def Slice_Triggered(self, action, clip_ids, trans_ids, playhead_position=0):
         """Callback for slice context menus"""
         # Get FPS from project
-        fps = get_app().project.get(["fps"])
+        fps = get_app().project.get("fps")
         fps_num = float(fps["num"])
         fps_den = float(fps["den"])
         fps_float = fps_num / fps_den
@@ -1754,7 +1769,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
                 continue
 
             # Determine if waveform needs to be redrawn
-            has_audio_data = bool(self.eval_js(JS_SCOPE_SELECTOR + ".hasAudioData('" + clip_id + "');"))
+            has_audio_data = clip_id in self.waveform_cache
 
             if action == MENU_SLICE_KEEP_LEFT or action == MENU_SLICE_KEEP_BOTH:
                 # Get details of original clip
@@ -1773,9 +1788,6 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
                 clip.data["position"] = playhead_position
                 clip.data["start"] = start_of_clip + (playhead_position - position_of_clip)
 
-                # Update thumbnail for right clip (after the clip has been created)
-                self.UpdateClipThumbnail(clip.data)
-
             if action == MENU_SLICE_KEEP_BOTH:
                 # Add the 2nd clip (the right side, since the left side has already been adjusted above)
                 # Get right side clip object
@@ -1790,10 +1802,6 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
                 right_clip.data.pop('id')
                 right_clip.key.pop(1)
 
-                # Get details of original clip
-                position_of_clip = float(right_clip.data["position"])
-                start_of_clip = float(right_clip.data["start"])
-
                 # Set new 'start' of right_clip (need to bump 1 frame duration more, so we don't repeat a frame)
                 right_clip.data["position"] = (round(float(playhead_position) * fps_float) + 1) / fps_float
                 right_clip.data["start"] = (round(float(clip.data["end"]) * fps_float) + 2) / fps_float
@@ -1801,25 +1809,22 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
                 # Save changes
                 right_clip.save()
 
-                # Update thumbnail for right clip (after the clip has been created)
-                self.UpdateClipThumbnail(right_clip.data)
-
                 # Save changes again (with new thumbnail)
                 self.update_clip_data(right_clip.data, only_basic_props=False, ignore_reader=True)
 
                 if has_audio_data:
-                    # Re-generate waveform since volume curve has changed
-                    log.info("Generate right splice waveform for clip id: %s" % right_clip.id)
-                    self.Show_Waveform_Triggered(right_clip.id)
+                    # Add right clip audio to cache
+                    self.waveform_cache[right_clip.id] = self.waveform_cache.get(clip_id, '[]')
+
+                    # Pass audio to javascript timeline (and render)
+                    cmd = JS_SCOPE_SELECTOR + ".setAudioData('" + right_clip.id + "', " + self.waveform_cache.get(right_clip.id) + ");"
+                    self.page().mainFrame().evaluateJavaScript(cmd)
 
             # Save changes
             self.update_clip_data(clip.data, only_basic_props=False, ignore_reader=True)
 
-            if has_audio_data:
-                # Re-generate waveform since volume curve has changed
-                log.info("Generate left splice waveform for clip id: %s" % clip.id)
-                self.Show_Waveform_Triggered(clip.id)
-
+        # Start timer to redraw audio waveforms
+        self.redraw_audio_timer.start()
 
         # Loop through each transition (using the list of ids)
         for trans_id in trans_ids:
@@ -1882,7 +1887,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         prop_name = "volume"
 
         # Get FPS from project
-        fps = get_app().project.get(["fps"])
+        fps = get_app().project.get("fps")
         fps_float = float(fps["num"]) / float(fps["den"])
 
         # Loop through each selected clip
@@ -1981,7 +1986,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         prop_name = "rotation"
 
         # Get FPS from project
-        fps = get_app().project.get(["fps"])
+        fps = get_app().project.get("fps")
         fps_float = float(fps["num"]) / float(fps["den"])
 
         # Loop through each selected clip
@@ -2026,7 +2031,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         prop_name = "time"
 
         # Get FPS from project
-        fps = get_app().project.get(["fps"])
+        fps = get_app().project.get("fps")
         fps_float = float(fps["num"]) / float(fps["den"])
 
         # Loop through each selected clip
@@ -2175,13 +2180,6 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
                 p_object = json.loads(p.Json())
                 clip.data[prop_name] = { "Points" : [p_object]}
 
-                # Reset original end & duration (if available)
-                if "original_data" in clip.data.keys():
-                    clip.data["end"] = clip.data["original_data"]["end"]
-                    clip.data["duration"] = clip.data["original_data"]["duration"]
-                    clip.data["reader"]["video_length"] = clip.data["original_data"]["video_length"]
-                    clip.data.pop("original_data")
-
                 # Get the ending frame
                 end_of_clip = round(float(clip.data["end"]) * fps_float) + 1
 
@@ -2217,6 +2215,14 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
                     clip.data["end"] = (start_animation + (duration_animation / speed_factor)) / fps_float
                     clip.data["duration"] = self.round_to_multiple(clip.data["duration"] / speed_factor, even_multiple)
                     clip.data["reader"]["video_length"] = str(self.round_to_multiple(float(clip.data["reader"]["video_length"]) / speed_factor, even_multiple))
+
+                if action == MENU_TIME_NONE:
+                    # Reset original end & duration (if available)
+                    if "original_data" in clip.data.keys():
+                        clip.data["end"] = clip.data["original_data"]["end"]
+                        clip.data["duration"] = clip.data["original_data"]["duration"]
+                        clip.data["reader"]["video_length"] = clip.data["original_data"]["video_length"]
+                        clip.data.pop("original_data")
 
             # Save changes
             self.update_clip_data(clip.data, only_basic_props=False, ignore_reader=True)
@@ -2344,7 +2350,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         clip_ids = self.window.selected_clips
 
         # Get framerate
-        fps = get_app().project.get(["fps"])
+        fps = get_app().project.get("fps")
         fps_float = float(fps["num"]) / float(fps["den"])
 
         # Get playhead position
@@ -2477,21 +2483,21 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
             # Invalid clip
             return
 
-        path = clip.data['reader']['path']
+        preview_path = clip.data['reader']['path']
 
         # Adjust frame # to valid range
         frame_number = max(frame_number, 1)
         frame_number = min(frame_number, int(clip.data['reader']['video_length']))
 
         # Load the clip into the Player (ignored if this has already happened)
-        self.window.LoadFileSignal.emit(path)
+        self.window.LoadFileSignal.emit(preview_path)
         self.window.SpeedSignal.emit(0)
 
         # Seek to frame
         self.window.SeekSignal.emit(frame_number)
 
-    @pyqtSlot(float, int, str)
-    def PlayheadMoved(self, position_seconds, position_frames, time_code):
+    @pyqtSlot(int)
+    def PlayheadMoved(self, position_frames):
 
         # Load the timeline into the Player (ignored if this has already happened)
         self.window.LoadFileSignal.emit('')
@@ -2501,15 +2507,21 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
             self.last_position_frames = position_frames
 
             # Notify main window of current frame
-            self.window.previewFrame(position_seconds, position_frames, time_code)
+            self.window.previewFrame(position_frames)
 
     @pyqtSlot(int)
     def movePlayhead(self, position_frames):
         """ Move the playhead since the position has changed inside OpenShot (probably due to the video player) """
-
         # Get access to timeline scope and set scale to zoom slider value (passed in)
-        code = JS_SCOPE_SELECTOR + ".MovePlayheadToFrame(" + str(position_frames) + ");"
+        code = JS_SCOPE_SELECTOR + ".MovePlayheadToFrame(%s);" % (str(position_frames))
         self.eval_js(code)
+
+    @pyqtSlot()
+    def centerOnPlayhead(self):
+        """ Center the timeline on the current playhead position """
+        # Execute JavaScript to center the timeline
+        cmd = JS_SCOPE_SELECTOR + '.centerOnPlayhead();';
+        self.eval_js(cmd)
 
     @pyqtSlot(int)
     def SetSnappingMode(self, enable_snapping):
@@ -2524,6 +2536,11 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
 
         # Init razor state (1 = razor, 0 = no razor)
         self.eval_js(JS_SCOPE_SELECTOR + ".SetRazorMode(%s);" % int(enable_razor))
+
+    @pyqtSlot(int)
+    def SetPlayheadFollow(self, enable_follow):
+        """ Enable / Disable playhead follow on seek """
+        self.eval_js(JS_SCOPE_SELECTOR + ".SetFollow({});".format(int(enable_follow)))
 
     @pyqtSlot(str, str, bool)
     def addSelection(self, item_id, item_type, clear_existing=False):
@@ -2562,15 +2579,19 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
 
         # Get access to timeline scope and set scale to new computed value
         cmd = JS_SCOPE_SELECTOR + ".setScale(" + str(newScale) + "," + str(cursor_x) + ");"
-        self.page().mainFrame().evaluateJavaScript(cmd)
+        self.eval_js(cmd)
 
         # Start timer to redraw audio
         self.redraw_audio_timer.start()
 
+        # Only update scale if different
+        current_scale = get_app().project.get("scale")
+
         # Save current zoom
-        get_app().updates.ignore_history = True
-        get_app().updates.update(["scale"], newScale)
-        get_app().updates.ignore_history = False
+        if newScale != current_scale:
+            get_app().updates.ignore_history = True
+            get_app().updates.update(["scale"], newScale)
+            get_app().updates.ignore_history = False
 
     def keyPressEvent(self, event):
         """ Keypress callback for timeline """
@@ -2658,7 +2679,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
             thumb_path = os.path.join(info.PATH, "images", "AudioThumbnail.png")
 
         # Get file name
-        path, filename = os.path.split(file.data["path"])
+        filename = os.path.basename(file.data["path"])
 
         # Convert path to the correct relative path (based on this folder)
         file_path = file.absolute_path()
@@ -2670,7 +2691,6 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         new_clip = json.loads(c.Json())
         new_clip["file_id"] = file.id
         new_clip["title"] = filename
-        new_clip["image"] = thumb_path
 
         # Skip any clips that are missing a 'reader' attribute
         # TODO: Determine why this even happens, as it shouldn't be possible
@@ -2696,7 +2716,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         # Adjust clip duration, start, and end
         new_clip["duration"] = new_clip["reader"]["duration"]
         if file.data["media_type"] == "image":
-            new_clip["end"] = self.settings.get("default-image-length")  # default to 8 seconds
+            new_clip["end"] = self.settings_obj.get("default-image-length")  # default to 8 seconds
 
         # Overwrite frame rate (incase the user changed it in the File Properties)
         file_properties_fps = float(file.data["fps"]["num"]) / float(file.data["fps"]["den"])
@@ -2736,7 +2756,7 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         js_position = self.eval_js(JS_SCOPE_SELECTOR + ".GetJavaScriptPosition(" + str(position.x()) + ");")
 
         # Get FPS from project
-        fps = get_app().project.get(["fps"])
+        fps = get_app().project.get("fps")
         fps_float = float(fps["num"]) / float(fps["den"])
 
         # Open up QtImageReader for transition Image
@@ -2930,8 +2950,14 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
         self.last_position_frames = None
         self.document_is_ready = False
 
+        # Delete the webview when closed
+        self.setAttribute(Qt.WA_DeleteOnClose)
+
+        # Disable image caching on timeline
+        self.settings().setObjectCacheCapacities(0, 0, 0)
+
         # Get settings
-        self.settings = settings.get_settings()
+        self.settings_obj = settings.get_settings()
 
         # Add self as listener to project data updates (used to update the timeline)
         get_app().updates.add_listener(self)
@@ -2947,6 +2973,12 @@ class TimelineWebView(QWebView, updates.UpdateInterface):
 
         # Connect waveform generation signal
         get_app().window.WaveformReady.connect(self.Waveform_Ready)
+
+        # Local audio waveform cache
+        self.waveform_cache = {}
+
+        # Connect update thumbnail signal
+        get_app().window.ThumbnailUpdated.connect(self.Thumbnail_Updated)
 
         # Copy clipboard
         self.copy_clipboard = {}

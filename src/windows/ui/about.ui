@@ -23,8 +23,8 @@
    <string>About OpenShot</string>
   </property>
   <property name="windowIcon">
-   <iconset>
-    <normaloff>../../images/openshot.svg</normaloff>../../images/openshot.svg</iconset>
+   <iconset resource="../../images/openshot.qrc">
+    <normaloff>:/openshot.svg</normaloff>:/openshot.svg</iconset>
   </property>
   <property name="locale">
    <locale language="English" country="UnitedStates"/>
@@ -41,7 +41,7 @@
         </sizepolicy>
        </property>
        <property name="pixmap">
-        <pixmap>../../images/AboutLogo.png</pixmap>
+        <pixmap  resource="../../images/openshot.qrc">:/about/AboutLogo.png</pixmap>
        </property>
       </widget>
      </item>
@@ -100,6 +100,13 @@
         <widget class="QPushButton" name="btnlicense">
          <property name="text">
           <string>License</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="btnchangelog">
+         <property name="text">
+          <string>Changelog</string>
          </property>
         </widget>
        </item>
